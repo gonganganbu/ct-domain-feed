@@ -55,3 +55,4 @@ fengyueai.pro
 fengyues.cn
 genraton.xyz
 ct-sync-test.invalid
+ct-lock-test.invalid
