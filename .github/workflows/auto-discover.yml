@@ -1,4 +1,4 @@
-name: Auto-discover AI Fengyue domains
+name: Auto-discover AI Fengyue domains (strict V2)
 
 on:
   schedule:
@@ -219,31 +219,52 @@ jobs:
                   accepted[d] = "direct trusted-navigation evidence"
                   continue
 
-              if BRAND_DOMAIN_RE.search(d) and evidence[d]:
-                  accepted[d] = "brand-bearing domain + discovery evidence"
-                  continue
+              # V2 STRICT MODE:
+              # Even a brand-looking domain is NOT auto-added from search evidence alone.
+              # It must be live-verifiable by page branding or redirect relationship.
+              is_brand_domain = bool(BRAND_DOMAIN_RE.search(d))
 
-              if len(evidence[d]) < 2:
-                  continue
+              # Random-looking domains require >=2 independent discovery labels.
+              # Brand-looking domains may proceed with >=1 label, but still need live verification.
+              if is_brand_domain:
+                  if len(evidence[d]) < 1:
+                      continue
+              else:
+                  if len(evidence[d]) < 2:
+                      continue
 
               page_ok = False
+              verification_reason = ""
               for scheme in ("https", "http"):
                   try:
-                      text, final = fetch(f"{scheme}://{d}", timeout=10)
+                      page_text, final = fetch(f"{scheme}://{d}", timeout=10)
                   except Exception:
                       continue
+
                   final_d = norm_domain(final)
-                  text_l = text.lower()
-                  if any(w in text_l for w in BRAND_WORDS):
+                  page_l = page_text.lower()
+
+                  if any(w in page_l for w in BRAND_WORDS):
                       page_ok = True
+                      verification_reason = "live page contains AI Fengyue/AIEro brand markers"
                   elif final_d and (
                       final_d in existing or BRAND_DOMAIN_RE.search(final_d)
                   ):
                       page_ok = True
+                      verification_reason = f"live redirect resolves to related host: {final_d}"
                   break
 
-              if page_ok:
-                  accepted[d] = "2+ independent discoveries + live-page verification"
+              if not page_ok:
+                  continue
+
+              if is_brand_domain:
+                  accepted[d] = (
+                      "brand-bearing domain + discovery evidence + " + verification_reason
+                  )
+              else:
+                  accepted[d] = (
+                      "2+ independent discoveries + " + verification_reason
+                  )
 
           new_domains = sorted(set(accepted) - existing)
           Path("new-domains.txt").write_text(
