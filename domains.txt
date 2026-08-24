@@ -59,3 +59,5 @@ ct-lock-test.invalid
 aifengy.cc
 fengyueai.com
 
+fengyueapp.com.cn
+fengyueba.cn
