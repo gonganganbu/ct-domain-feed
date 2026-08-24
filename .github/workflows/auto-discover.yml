@@ -1,0 +1,298 @@
+name: Auto-discover AI Fengyue domains
+
+on:
+  schedule:
+    - cron: "20 21 * * *"  # 05:20 UTC+8, before local 06:00 sync
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ct-domain-feed-auto-discovery
+  cancel-in-progress: false
+
+jobs:
+  discover:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Discover and verify candidate domains
+        shell: bash
+        run: |
+          python - <<'PY'
+          from __future__ import annotations
+          import html, json, re, ssl, time
+          import urllib.parse, urllib.request
+          import xml.etree.ElementTree as ET
+          from collections import defaultdict
+          from pathlib import Path
+
+          BLOCKLIST = Path("domains.txt")
+
+          TRUSTED_NAV_PAGES = [
+              "https://aierocom.github.io/leading/",
+              "https://aifordum.github.io/",
+          ]
+
+          SEARCH_QUERIES = [
+              '"AI风月" 最新网址',
+              '"AI风月" 防迷路',
+              '"AI风月" 备用网址',
+              '"AI风月" 永久地址',
+              '"AI风月" 镜像',
+              '"风月AI" 备用网址',
+              '"AIEro" mirror',
+              '"AIEro" alternate domain',
+              '"AIEro" new domain',
+              'site:github.io "AI风月"',
+              'site:pages.dev "AI风月"',
+          ]
+
+          BRAND_WORDS = [
+              "ai风月", "风月ai", "aiero", "aifengyue", "fengyueai",
+              "aiporn", "aifuck", "aierocom", "aifordum"
+          ]
+          BRAND_DOMAIN_RE = re.compile(
+              r"(aiero|aifengyue|fengyueai|aiporn|aifuck|aierocom|aifordum)",
+              re.I,
+          )
+
+          PROTECTED_EXACT = {
+              "google.com","bing.com","baidu.com","github.com","github.io",
+              "raw.githubusercontent.com","githubusercontent.com",
+              "microsoft.com","openai.com","reddit.com","x.com","twitter.com",
+              "cloudflare.com","pages.dev","vercel.app","wikipedia.org",
+              "archive.org","scamadviser.com","youtube.com","facebook.com",
+              "instagram.com","tiktok.com","zhihu.com","weibo.com",
+          }
+
+          DOMAIN_RE = re.compile(
+              r"(?i)\b(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,24}\b"
+          )
+          UA = "Mozilla/5.0 ct-domain-feed-defensive-discovery/1.0"
+          ctx = ssl.create_default_context()
+
+          def fetch(url: str, timeout: int = 15):
+              req = urllib.request.Request(
+                  url,
+                  headers={
+                      "User-Agent": UA,
+                      "Accept": "text/html,application/xhtml+xml,application/xml,"
+                                "application/rss+xml,text/plain;q=0.9,*/*;q=0.8",
+                  },
+              )
+              with urllib.request.urlopen(req, timeout=timeout, context=ctx) as r:
+                  raw = r.read(1_500_000)
+                  final = r.geturl()
+                  charset = r.headers.get_content_charset() or "utf-8"
+              try:
+                  text = raw.decode(charset, errors="replace")
+              except LookupError:
+                  text = raw.decode("utf-8", errors="replace")
+              return text, final
+
+          def norm_domain(value: str):
+              value = html.unescape(value).strip().lower().strip(".")
+              if "://" in value:
+                  try:
+                      value = urllib.parse.urlparse(value).hostname or ""
+                  except Exception:
+                      return None
+              if value.startswith("www."):
+                  value = value[4:]
+              try:
+                  value = value.encode("idna").decode("ascii")
+              except Exception:
+                  return None
+              if not re.fullmatch(
+                  r"(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}",
+                  value,
+              ):
+                  return None
+              return value
+
+          def protected(d):
+              return d in PROTECTED_EXACT
+
+          existing = set()
+          if BLOCKLIST.exists():
+              for line in BLOCKLIST.read_text(encoding="utf-8").splitlines():
+                  d = norm_domain(line)
+                  if d:
+                      existing.add(d)
+
+          evidence = defaultdict(set)
+          trusted_nav_direct = set()
+
+          href_re = re.compile(r"(?is)href\s*=\s*[\"'](https?://[^\"'<>]+)[\"']")
+          host_json_re = re.compile(r"(?is)[\"']host[\"']\s*:\s*[\"']([^\"']+)[\"']")
+
+          # 1) Trusted navigation pages.
+          for page in TRUSTED_NAV_PAGES:
+              try:
+                  text, final = fetch(page)
+              except Exception as e:
+                  print(f"[warn] trusted page failed: {page}: {e}")
+                  continue
+              src_host = norm_domain(final)
+              for m in href_re.finditer(text):
+                  d = norm_domain(m.group(1))
+                  if not d or protected(d) or d == src_host:
+                      continue
+                  evidence[d].add(f"trusted-nav:{src_host}")
+                  trusted_nav_direct.add(d)
+              for m in host_json_re.finditer(text):
+                  d = norm_domain(m.group(1))
+                  if not d or protected(d):
+                      continue
+                  evidence[d].add(f"trusted-nav-host:{src_host}")
+                  trusted_nav_direct.add(d)
+
+          # 2) Multi-query Bing RSS.
+          for idx, q in enumerate(SEARCH_QUERIES):
+              rss = "https://www.bing.com/search?" + urllib.parse.urlencode(
+                  {"q": q, "format": "rss"}
+              )
+              try:
+                  xml_text, _ = fetch(rss)
+                  root = ET.fromstring(xml_text)
+              except Exception as e:
+                  print(f"[warn] search failed: {q}: {e}")
+                  continue
+
+              for item in root.findall(".//item"):
+                  title = item.findtext("title") or ""
+                  link = item.findtext("link") or ""
+                  desc = item.findtext("description") or ""
+                  blob = html.unescape(f"{title}\n{link}\n{desc}")
+                  blob_l = blob.lower()
+
+                  result_d = norm_domain(link)
+                  if result_d and not protected(result_d):
+                      if any(w in blob_l for w in BRAND_WORDS):
+                          evidence[result_d].add(f"bing-query:{idx}")
+
+                  for dm in DOMAIN_RE.findall(blob):
+                      d = norm_domain(dm)
+                      if d and not protected(d) and any(w in blob_l for w in BRAND_WORDS):
+                          evidence[d].add(f"bing-snippet:{idx}")
+              time.sleep(0.2)
+
+          # 3) Certificate Transparency for aiero.com family.
+          try:
+              ct_text, _ = fetch("https://crt.sh/?q=%25.aiero.com&output=json")
+              for row in json.loads(ct_text):
+                  for name in str(row.get("name_value", "")).splitlines():
+                      d = norm_domain(name.removeprefix("*.").strip())
+                      if d and not protected(d):
+                          evidence[d].add("crt:aiero.com")
+          except Exception as e:
+              print(f"[warn] crt.sh failed: {e}")
+
+          # 4) Conservative verification.
+          accepted = {}
+          ranked = sorted(
+              evidence,
+              key=lambda d: (
+                  d not in trusted_nav_direct,
+                  not bool(BRAND_DOMAIN_RE.search(d)),
+                  -len(evidence[d]),
+                  d,
+              ),
+          )[:80]
+
+          for d in ranked:
+              if d in existing or protected(d):
+                  continue
+
+              if d in trusted_nav_direct:
+                  accepted[d] = "direct trusted-navigation evidence"
+                  continue
+
+              if BRAND_DOMAIN_RE.search(d) and evidence[d]:
+                  accepted[d] = "brand-bearing domain + discovery evidence"
+                  continue
+
+              if len(evidence[d]) < 2:
+                  continue
+
+              page_ok = False
+              for scheme in ("https", "http"):
+                  try:
+                      text, final = fetch(f"{scheme}://{d}", timeout=10)
+                  except Exception:
+                      continue
+                  final_d = norm_domain(final)
+                  text_l = text.lower()
+                  if any(w in text_l for w in BRAND_WORDS):
+                      page_ok = True
+                  elif final_d and (
+                      final_d in existing or BRAND_DOMAIN_RE.search(final_d)
+                  ):
+                      page_ok = True
+                  break
+
+              if page_ok:
+                  accepted[d] = "2+ independent discoveries + live-page verification"
+
+          new_domains = sorted(set(accepted) - existing)
+          Path("new-domains.txt").write_text(
+              ("\n".join(new_domains) + "\n") if new_domains else "",
+              encoding="utf-8",
+          )
+
+          if not new_domains:
+              print("No new high-confidence domains found.")
+              raise SystemExit(0)
+
+          original = BLOCKLIST.read_text(encoding="utf-8") if BLOCKLIST.exists() else ""
+          with BLOCKLIST.open("a", encoding="utf-8") as f:
+              if original and not original.endswith("\n"):
+                  f.write("\n")
+              for d in new_domains:
+                  f.write(d + "\n")
+
+          print("NEW HIGH-CONFIDENCE DOMAINS:")
+          for d in new_domains:
+              print(f"  + {d}: {accepted[d]}; evidence={sorted(evidence[d])}")
+          PY
+
+      - name: Show result
+        if: always()
+        shell: bash
+        run: |
+          echo "### Auto-discovery result" >> "$GITHUB_STEP_SUMMARY"
+          if [ -s new-domains.txt ]; then
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "New domains appended:" >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+            cat new-domains.txt >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "No new high-confidence domains were added." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Commit verified additions
+        if: success()
+        shell: bash
+        run: |
+          if git diff --quiet -- domains.txt; then
+            echo "No blocklist change."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add domains.txt
+          git commit -m "chore: auto-add verified mirror domains"
+          git push
