@@ -57,6 +57,5 @@ genraton.xyz
 ct-sync-test.invalid
 ct-lock-test.invalid
 aifengy.cc
-fengyueai.cn
 fengyueai.com
-fengyueba.cn
+
